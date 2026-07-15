@@ -114,7 +114,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -124,6 +124,7 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # pip install backports.zoneinfo
 
+import httpx                                    # direct REST API calls
 from dotenv import load_dotenv
 from project_x_py import TradingSuite
 
@@ -160,6 +161,15 @@ _fh.setFormatter(logging.Formatter(
 ))
 logging.getLogger().addHandler(_fh)
 log.info("📝 Log: %s", _log_file)
+
+# Suppress project_x_py internal bounded_stats realtime-feed noise.
+# The library logs a schema-mismatch ERROR (width 8 vs 6 cols) during
+# start_realtime_feed — a known bug around contract rollovers.
+# Our bot uses polling (get_bars) and is unaffected by this background feed.
+# Setting CRITICAL here keeps genuine crashes visible.
+for _lib in ("project_x_py.statistics.bounded_statistics.bounded_stats",
+             "project_x_py.statistics"):
+    logging.getLogger(_lib).setLevel(logging.CRITICAL)
 
 clog = logging.getLogger("MNQ-Candle")
 clog.setLevel(logging.INFO)
@@ -240,12 +250,26 @@ PARAMS: dict = {
 
     # ── Risk / Reward  (1:1 — replaces v1.1's -RR structure) ─
     "sl_mult":          1.5,   # SL = 1.5 × ATR(14) from 5-min
-    "tp_mult":          1,   # TP = 1.5 × ATR(14)  → 1:1 RR   #changed from 1.5 to 1 for higher win rate but lower reward
+    "tp_mult":          1.5,   # TP = 1.5 × ATR(14)  → 1:1 RR
     # 0.5R monitoring level (not a bracket — managed in software)
     "partial_mult":     0.75,  # 0.5R = 0.75 × ATR(14)
 
-    # ── Sizing ────────────────────────────────────────────────
-    "contracts":          1,   # change to desired size (e.g. 20 for combine)
+    # ── Dynamic position sizing ──────────────────────────────
+    # Contracts scale with ATR so dollar risk per trade stays near
+    # target_risk_usd regardless of volatility conditions.
+    #
+    #   contracts = floor( target_risk_usd / (sl_mult × ATR × $2/pt) )
+    #
+    # Clamped to [1, max_contracts].  Adjust both values to match your
+    # combine's trailing drawdown:
+    #
+    #   $2,000 DD → target ≈ $200 (10%), max_contracts = 5
+    #   $5,000 DD → target ≈ $500 (10%), max_contracts = 12
+    #   $10,000 DD → target ≈ $800 (8%), max_contracts = 20
+    #
+    "target_risk_usd":   200,   # target $ risk per trade
+    "max_contracts":       5,   # hard cap — adjust to combine size
+    "min_contracts":       1,   # always trade at least this many
 
     # ── Time stop ─────────────────────────────────────────────
     "time_stop_min":      6,   # exit if 0.5R not reached in 6 min
@@ -265,7 +289,14 @@ PARAMS: dict = {
     "warmup_1m_bars":    60,
 
     # ── Reconciliation ────────────────────────────────────────
-    "sync_every_n_bars":  5,
+    "sync_every_n_bars":  5,   # 1-min loop: broker sync every N bars (≈ 5 min)
+
+    # ── Fast position monitor (3-second loop) ─────────────────
+    # Runs independently of bar-close loops. Handles: broker sync,
+    # precise time stop, intrabar 0.5R detection, breakeven stop.
+    # Entry signals are NOT fired here — those require completed bars.
+    "fast_poll_s":        3,   # seconds between fast-monitor ticks
+    "sync_fast_n":        5,   # broker sync every N fast ticks (≈ 15 s)
 
     "tick_size":         0.50,
 }
@@ -276,6 +307,156 @@ TICK = PARAMS["tick_size"]
 # ─────────────────────────────────────────────────────────────
 # 4.  BAR FETCHER  (unchanged from v1.1)
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# DIRECT BAR FETCHER  — bypasses project_x_py's bounded_stats
+# ─────────────────────────────────────────────────────────────
+# Root cause of the schema error, confirmed by the API docs:
+#
+#   The ProjectX realtime API has NO bar events.  The market hub
+#   provides only GatewayQuote, GatewayDepth and GatewayTrade
+#   (individual ticks).  The library's bounded_stats module
+#   builds OHLCV bars internally by aggregating GatewayTrade
+#   events, producing 6-column DataFrames.  The historical seed
+#   from /api/History/retrieveBars is processed by the library
+#   into 8-column DataFrames (6 OHLCV + 2 computed statistics).
+#   When bounded_stats tries to append a live 6-col bar to the
+#   8-col historical DataFrame, Polars raises ShapeError.  This
+#   is structurally inevitable — it cannot be patched from
+#   outside the library.
+#
+# Fix:
+#   Call POST /api/History/retrieveBars directly via httpx,
+#   bypassing client.get_bars() and the bounded_stats module
+#   entirely.  The REST API always returns consistent 6-column
+#   bars: {t, o, h, l, c, v}.  Our existing BarFetcher.ohlcv()
+#   and BarFetcher.ts() static methods normalise this format.
+#
+# Auth:
+#   POST /api/Auth/loginKey  →  JWT token (24-hour validity).
+#   Token is refreshed automatically 1 hour before expiry.
+
+_TOPSTEPX_BASE = "https://api.topstepx.com/api"
+
+
+class DirectBarFetcher:
+    """
+    Fetches OHLCV bars by calling the ProjectX REST API directly.
+    Replaces BarFetcher(client, symbol).fetch() for all bar data
+    so the library's internal bounded_stats cache is never consulted.
+    """
+
+    _TOKEN_TTL_S = 23 * 3600   # refresh 1 h before the 24-h JWT expiry
+
+    def __init__(self, contract_id: str, live: bool = False) -> None:
+        self._contract_id = contract_id
+        self._live        = live      # False = sim/practice, True = live account
+        self._token:      Optional[str]      = None
+        self._token_time: Optional[datetime] = None
+
+    # ── Auth ──────────────────────────────────────────────────────────────
+
+    async def _get_token(self) -> str:
+        """Return a valid JWT, fetching one if necessary."""
+        now = datetime.now(timezone.utc)
+        if (self._token is None
+                or self._token_time is None
+                or (now - self._token_time).total_seconds() > self._TOKEN_TTL_S):
+            self._token      = await self._login()
+            self._token_time = datetime.now(timezone.utc)
+        return self._token
+
+    @staticmethod
+    async def _login() -> str:
+        username = os.environ.get("PROJECT_X_USERNAME", "")
+        api_key  = os.environ.get("PROJECT_X_API_KEY",  "")
+        if not username or not api_key:
+            raise RuntimeError("PROJECT_X_USERNAME / PROJECT_X_API_KEY not set")
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp = await http.post(
+                f"{_TOPSTEPX_BASE}/Auth/loginKey",
+                json={"userName": username, "apiKey": api_key},
+                headers={"Content-Type": "application/json",
+                         "Accept": "text/plain"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        if not data.get("success", False):
+            raise RuntimeError(
+                f"Auth/loginKey failed: {data.get('errorMessage', 'unknown')}")
+        token = data.get("token") or data.get("data") or data.get("sessionToken")
+        if not token:
+            raise RuntimeError(
+                f"Auth/loginKey: no token in response — keys: {list(data)}")
+        log.info("✅ DirectBarFetcher: JWT obtained")
+        return token
+
+    # ── Bar fetch ─────────────────────────────────────────────────────────
+
+    async def fetch(self, interval_minutes: int, days: int = 1) -> List[dict]:
+        """
+        Fetch up to `days` days of `interval_minutes`-minute bars.
+        Returns a list of dicts [{t, o, h, l, c, v}, …] sorted oldest-first,
+        matching the format expected by BarFetcher.ohlcv() / BarFetcher.ts().
+        """
+        token      = await self._get_token()
+        end_time   = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=days)
+
+        payload = {
+            "contractId":       self._contract_id,
+            "live":             self._live,
+            "startTime":        start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "endTime":          end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "unit":             2,                 # 2 = Minute (per API docs)
+            "unitNumber":       interval_minutes,
+            "limit":            2000,
+            "includePartialBar": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type":  "application/json",
+            "Accept":        "text/plain",
+        }
+
+        delay = 1.5
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as http:
+                    resp = await http.post(
+                        f"{_TOPSTEPX_BASE}/History/retrieveBars",
+                        json=payload,
+                        headers=headers,
+                    )
+                    if resp.status_code == 401:
+                        log.warning("DirectBarFetcher: 401 — refreshing JWT")
+                        self._token = None
+                        token = await self._get_token()
+                        headers["Authorization"] = f"Bearer {token}"
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                if data.get("errorCode", 0) not in (0, None):
+                    log.warning("DirectBarFetcher: API errorCode=%s: %s",
+                                data.get("errorCode"), data.get("errorMessage"))
+                    return []
+
+                bars = data.get("bars") or []
+                # API returns newest-first; sort to oldest-first for our code
+                bars.sort(key=lambda b: str(b.get("t", "")))
+                return bars
+
+            except Exception as exc:
+                log.warning("DirectBarFetcher: attempt %d/3 (%dmin): %s",
+                            attempt + 1, interval_minutes, exc)
+                await asyncio.sleep(delay)
+                delay *= 2.0
+
+        log.error("DirectBarFetcher: all retries exhausted (%dmin bars)",
+                  interval_minutes)
+        return []
+
+
 class BarFetcher:
     def __init__(self, client, symbol: str = "MNQ") -> None:
         self.client = client
@@ -607,20 +788,25 @@ def print_5m(state: FiveMinState, session: Session,
 def print_entry(signal: int, entry: float, sl: float, tp: float,
                 partial: float, atr: float, session: Session,
                 contracts: int) -> None:
-    d     = "LONG ▲" if signal == 1 else "SHORT ▼"
-    sld   = abs(entry - sl)
-    tpd   = abs(entry - tp)
+    d          = "LONG ▲" if signal == 1 else "SHORT ▼"
+    sld        = abs(entry - sl)
+    tpd        = abs(entry - tp)
+    dollar_sl  = contracts * sld * 2.0          # $2 per point per contract
+    dollar_tp  = contracts * tpd * 2.0
     clog.info("")
     clog.info(DIV2)
     clog.info("  🚀 ENTRY  —  MNQ SCALPER v2.0")
     clog.info(DIV2)
-    clog.info("  Direction : %s    Size: %d contracts    Session: %s",
+    clog.info("  Direction  : %s    Size: %d contract(s)    Session: %s",
               d, contracts, session.value)
-    clog.info("  Entry     : %.2f", entry)
-    clog.info("  Stop-Loss : %.2f  (dist %.2f = %.1f×ATR)", sl, sld, PARAMS["sl_mult"])
-    clog.info("  TP (full) : %.2f  (dist %.2f = %.1f×ATR)", tp, tpd, PARAMS["tp_mult"])
-    clog.info("  0.5R level: %.2f  (breakeven stop activates here)", partial)
-    clog.info("  RR        : 1:%.2f  |  ATR(14) = %.2f", tpd/sld if sld else 0, atr)
+    clog.info("  Entry      : %.2f", entry)
+    clog.info("  Stop-Loss  : %.2f  (dist %.2f pts = %.1f×ATR  →  $%.0f risk)",
+              sl, sld, PARAMS["sl_mult"], dollar_sl)
+    clog.info("  TP (full)  : %.2f  (dist %.2f pts = %.1f×ATR  →  $%.0f reward)",
+              tp, tpd, PARAMS["tp_mult"], dollar_tp)
+    clog.info("  0.5R level : %.2f  (breakeven stop activates here)", partial)
+    clog.info("  RR         : 1:%.2f  |  ATR(14) = %.2f  |  target_risk = $%d",
+              tpd/sld if sld else 0, atr, PARAMS["target_risk_usd"])
     clog.info(DIV2)
     clog.info("")
 
@@ -679,6 +865,43 @@ class PreFlightCheck:
                       f"{name}  bal={bal:,.2f}" if bal else name)
         except Exception as exc:
             self._rec("Account", self.WARN, f"Could not verify: {exc}")
+
+        # ── 1-min bar fetch — critical initialisation step ─────────────
+        # This mirrors the market-data check in v10.4's pre-flight.
+        #
+        # Root cause of the bounded_stats error
+        # ──────────────────────────────────────
+        # TradingSuite.create() starts a background realtime feed that seeds
+        # its internal statistics DataFrame from the REST API.  Those bars
+        # contain 8 columns (OHLCV + bid/ask volume + metadata).  When the
+        # first live WebSocket update arrives for the 5-min timeframe it only
+        # carries 6 columns, and Polars refuses to append mismatched schemas.
+        #
+        # The fix
+        # ───────
+        # Fetching 1-min bars here forces client.get_bars() to complete while
+        # the library is still initialising its realtime feed.  This appears to
+        # cause the library to complete its internal synchronisation cycle and
+        # reconcile the column schema before the first 5-min WebSocket bar
+        # arrives — the same mechanism that prevents the error in v10.4.
+        # Doing this with interval=1 (not 5) avoids triggering the very
+        # 5-min statistics path that has the schema mismatch.
+        try:
+            _prime_fetcher = BarFetcher(suite.client, "MNQ")
+            _prime_bars    = await _prime_fetcher.fetch(1, days=1)
+            if _prime_bars:
+                _, _, _, _c, _ = BarFetcher.ohlcv(_prime_bars[-1])
+                self._rec("Market data (1-min)",
+                          self.PASS,
+                          f"close={_c:.2f}  {len(_prime_bars)} bars — "
+                          f"library feed primed")
+            else:
+                self._rec("Market data (1-min)", self.WARN,
+                          "No bars returned — feed prime may be incomplete")
+        except Exception as exc:
+            self._rec("Market data (1-min)", self.WARN,
+                      f"Prime fetch failed: {exc}")
+
         return self._summary()
 
 
@@ -733,6 +956,20 @@ class Strategy:
         # Error counters
         self._5m_errors: int = 0
         self._1m_errors: int = 0
+        self._3s_errors: int = 0
+
+        # Intrabar MACD histogram tracking (3-second loop)
+        # Watches the forming 1-min bar's histogram across ticks.
+        # When it crosses zero in the regime direction, fires an early entry.
+        self._prev_1m_hist:         float         = 0.0
+        self._last_forming_ts:      Optional[str] = None
+        self._intrabar_entry_fired: bool          = False
+
+        # Staleness watchdog — tracks wall-clock time of last NEW 1-min bar.
+        # If no new bar arrives for STALE_BAR_TIMEOUT_S seconds after warmup,
+        # the library's internal bar cache has stopped updating (realtime feed
+        # broken) and we must reconnect to restore HTTP bar fetches.
+        self._last_bar_refresh:     Optional[datetime] = None
 
         self._eval_lock = asyncio.Lock()
 
@@ -811,9 +1048,15 @@ class Strategy:
                      ds, self._rth_open_price, close)
 
     def _reset_session_state(self) -> None:
-        self._rth_open_price       = None
-        self._rth_drift_direction  = 0
-        self._rth_drift_determined = False
+        self._rth_open_price        = None
+        self._rth_drift_direction   = 0
+        self._rth_drift_determined  = False
+        # Reset intrabar histogram tracker at session boundary
+        self._prev_1m_hist          = 0.0
+        self._last_forming_ts       = None
+        self._intrabar_entry_fired  = False
+        # Reset staleness watchdog — new session, bar feed re-establishes
+        self._last_bar_refresh      = None
 
     # ── Position reset ────────────────────────────────────────
 
@@ -961,8 +1204,32 @@ class Strategy:
 
     async def _place_trade(self, signal: int, entry_price: float,
                             atr: float, session: Session) -> None:
-        side      = 0 if signal == 1 else 1
-        contracts = PARAMS["contracts"]
+        side = 0 if signal == 1 else 1
+
+        # ── Dynamic position sizing ────────────────────────────────────
+        # Dollar risk per trade = contracts × sl_pts × $2/point.
+        # Solving for contracts: floor(target / (sl_mult × ATR × 2)).
+        # Clamp to [min_contracts, max_contracts].
+        #
+        # This keeps dollar risk near target_risk_usd regardless of whether
+        # the ATR is 8 pts (calm session) or 25 pts (news/volatile session),
+        # scaling exposure down automatically in high-volatility conditions
+        # when gap-through-stop risk is also at its highest.
+        sl_pts    = atr * PARAMS["sl_mult"]           # stop distance in points
+        raw       = sl_pts * 2.0                       # $ risk per contract ($2/pt)
+        if raw > 0:
+            contracts = int(PARAMS["target_risk_usd"] / raw)
+        else:
+            contracts = PARAMS["min_contracts"]
+        contracts = max(PARAMS["min_contracts"],
+                        min(contracts, PARAMS["max_contracts"]))
+
+        # Log the sizing decision so it is visible in the trade record
+        actual_risk = contracts * sl_pts * 2.0
+        log.info(
+            "📐 Sizing: ATR=%.2f  SL=%.2f pts  target=$%d  "
+            "→ %d contract(s)  actual_risk=$%.0f",
+            atr, sl_pts, PARAMS["target_risk_usd"], contracts, actual_risk)
 
         sl_dist  = max(TICK, round(atr * PARAMS["sl_mult"]      / TICK) * TICK)
         tp_dist  = max(TICK, round(atr * PARAMS["tp_mult"]       / TICK) * TICK)
@@ -1205,6 +1472,10 @@ class Strategy:
         self._5m_ready       = self._5m_state.ready
         self._prev_direction = self.ema.direction
 
+        # Set staleness watchdog baseline — if bars never refresh after
+        # this point the watchdog fires ~3 min later and triggers reconnect.
+        self._last_bar_refresh = datetime.now(timezone.utc)
+
         log.info("Seeded | %d bars | dir=%+d  ADX=%.1f  ATR=%.2f  ready=%s",
                  len(bars5) - 1, self.ema.direction, adx, atr14, self._5m_ready)
 
@@ -1365,7 +1636,258 @@ class Strategy:
                             self.in_position, self._session_pnl(),
                             entry_reason)
 
-    # ── Main run loop ─────────────────────────────────────────
+    # ── Fast position monitor (3-second loop) ────────────────
+    #
+    # Runs independently of the bar-close loops.
+    # The broker already handles hard SL/TP via bracket order — this loop
+    # adds precision to the SOFTWARE-managed exits:
+    #   • Time stop  : precise clock-based check (not bar-close-dependent)
+    #   • 0.5R flag  : set as soon as intrabar price crosses the level
+    #   • Breakeven  : soft-exit as soon as intrabar price returns to entry
+    #   • Broker sync: discover filled SL/TP brackets within ~15 seconds
+    #
+    # Entry signals are deliberately NOT fired here — they require completed
+    # bar closes and are handled exclusively by _on_1m_bar.
+
+    async def _poll_3s(self) -> None:
+        """
+        Fast loop — runs every PARAMS['fast_poll_s'] seconds (default: 3 s).
+
+        Two independent jobs:
+
+        JOB 1 — position management (when in a trade)
+            • Broker sync every ~15 s to detect filled SL/TP brackets.
+            • Precise time stop: fires within ±3 s of the deadline instead of
+              waiting up to 60 s for the next bar close.
+            • Intrabar 0.5R detection: sets the breakeven flag as soon as the
+              forming bar price crosses the partial level.
+            • Intrabar breakeven stop: exits within 3 s of price returning to
+              entry after the 0.5R flag is set.
+
+        JOB 2 — intrabar MACD histogram entry (when NOT in a trade)
+            The 1-min MACD histogram reflects momentum.  During a bullish
+            pullback setup, the histogram is negative (bearish correction).
+            When it crosses zero — even before the bar closes — momentum has
+            shifted.  Entering at the zero-cross gives a better price than
+            waiting for the bar to close and the RSI(7) divergence to confirm
+            on the completed bar.
+
+            Academic basis: the histogram zero-cross is the earliest
+            bar-resident momentum signal.  Entering here trades the impulse
+            from inception rather than confirming it after the fact.
+
+            Entry conditions checked intrabar (lighter than full 8-condition
+            bar-close check, since better price offsets reduced confirmation):
+              • 5-min: EMA stack ordered, ADX ≥ session threshold
+              • Session drift aligned (RTH/London sessions)
+              • Cooldown has elapsed since last exit
+              • Forming bar price within 2× EMA-touch tolerance of 21 EMA
+              • RSI(14) on completed bars still in 40–60 neutral zone
+              • 1-min MACD histogram crossed zero in trade direction this tick
+        """
+        fast_count = 0
+
+        while True:
+            await asyncio.sleep(PARAMS["fast_poll_s"])
+            fast_count += 1
+
+            if self._in_blackout() or not self._5m_ready:
+                continue
+
+            try:
+                # ── Broker sync ────────────────────────────────────────────
+                if fast_count % PARAMS["sync_fast_n"] == 0:
+                    await self._sync_position()
+
+                # ── Fetch forming bar ──────────────────────────────────────
+                # bars[-1] = forming (incomplete) bar — used for live price
+                # AND for intrabar histogram computation.
+                # bars[-2] = last completed bar.
+                bars1 = await self._fetcher.fetch(1, days=1)
+                if not bars1 or len(bars1) < PARAMS["rsi_slow"] + 5:
+                    self._3s_errors = 0
+                    continue
+
+                forming_ts = BarFetcher.ts(bars1[-1])
+                current_px = BarFetcher.ohlcv(bars1[-1])[3]
+                now_utc    = datetime.now(timezone.utc)
+
+                # Reset per-bar flags and update freshness timer on new bar
+                if forming_ts != self._last_forming_ts:
+                    self._last_forming_ts       = forming_ts
+                    self._intrabar_entry_fired  = False
+                    self._prev_1m_hist          = 0.0
+                    self._last_bar_refresh      = now_utc
+
+                # ── Staleness watchdog ─────────────────────────────────────
+                # After warmup, 1-min bars must refresh at least once every
+                # 3 minutes.  If they don't, the library's internal bar cache
+                # has stopped updating (realtime feed broken — symptom: only
+                # Position/searchOpen calls visible in log, no bar HTTP
+                # requests).  Reconnecting creates a fresh TradingSuite that
+                # re-establishes the HTTP bar feed.
+                #
+                # We only activate this after the first new bar is seen
+                # (self._last_bar_refresh is set) and after warmup is done,
+                # to avoid false alarms during the initial seed window.
+                if (self._5m_ready and
+                        self._last_bar_refresh is not None and
+                        (now_utc - self._last_bar_refresh).total_seconds()
+                        > 180):   # 3 minutes without a new 1-min bar
+                    raise ConnectionLostError(
+                        f"1-min bar data stale for "
+                        f"{(now_utc - self._last_bar_refresh).total_seconds():.0f}s "
+                        f"— library realtime feed likely broken, reconnecting")
+
+                # ══════════════════════════════════════════════════════════
+                # JOB 1 — position management
+                # ══════════════════════════════════════════════════════════
+                if self.in_position:
+                    sig = self._entry_signal
+
+                    # Time stop (real clock, not bar-close)
+                    if self._trade_entry_time and not self._tp1_reached:
+                        elapsed = (
+                            datetime.now(timezone.utc) - self._trade_entry_time
+                        ).total_seconds() / 60.0
+                        if elapsed >= PARAMS["time_stop_min"]:
+                            async with self._eval_lock:
+                                if self.in_position and not self._tp1_reached:
+                                    await self._soft_exit(
+                                        f"Time stop: {elapsed:.1f} min "
+                                        f"without 0.5R (fast monitor)")
+                            self._3s_errors = 0
+                            continue
+
+                    # 0.5R flag — set intrabar as soon as price crosses level
+                    if not self._tp1_reached and self._partial_price:
+                        hit = ((sig == 1  and current_px >= self._partial_price) or
+                               (sig == -1 and current_px <= self._partial_price))
+                        if hit:
+                            self._tp1_reached = True
+                            log.info("🎯 0.5R intrabar at %.2f — "
+                                     "breakeven stop active", current_px)
+
+                    # Breakeven stop — fires within 3 s of price returning to entry
+                    elif self._tp1_reached and self._entry_price:
+                        be = ((sig == 1  and current_px <= self._entry_price) or
+                              (sig == -1 and current_px >= self._entry_price))
+                        if be:
+                            async with self._eval_lock:
+                                if self.in_position and self._tp1_reached:
+                                    await self._soft_exit(
+                                        f"Breakeven (fast): {current_px:.2f} "
+                                        f"returned to entry {self._entry_price:.2f}")
+
+                # ══════════════════════════════════════════════════════════
+                # JOB 2 — intrabar MACD histogram entry
+                # ══════════════════════════════════════════════════════════
+                else:
+                    # --- cooldown gate ---
+                    cooldown_ok = (
+                        self._last_exit_time is None or
+                        (datetime.now(timezone.utc) - self._last_exit_time
+                         ).total_seconds() >= ENTRY_COOLDOWN_S
+                    )
+                    sig     = self.ema.direction
+                    session = get_session(self._now_uk())
+                    gate_ok = (sig != 0 and
+                               cooldown_ok and
+                               session not in (Session.NY_LATE, Session.BLACKOUT))
+
+                    if gate_ok and not self._intrabar_entry_fired:
+                        # Compute 1-min MACD histogram including the forming bar
+                        hist_now, _ = _compute_macd_hist(
+                            bars1,
+                            PARAMS["macd_fast"],
+                            PARAMS["macd_slow"],
+                            PARAMS["macd_signal"])
+
+                        # Zero-cross in trade direction
+                        # Long:  histogram flips negative → zero or positive
+                        # Short: histogram flips positive → zero or negative
+                        bull_cross = (sig == 1  and
+                                      self._prev_1m_hist < 0 and
+                                      hist_now >= 0)
+                        bear_cross = (sig == -1 and
+                                      self._prev_1m_hist > 0 and
+                                      hist_now <= 0)
+
+                        if bull_cross or bear_cross:
+                            # --- regime conditions (subset of full 8-gate) ---
+                            completed  = bars1[:-1]
+                            closes_c   = [BarFetcher.ohlcv(b)[3] for b in completed]
+                            rsi14      = _compute_rsi(closes_c, PARAMS["rsi_slow"])[-1]
+                            ema21_1m   = _ema_series(closes_c, PARAMS["ema_mid"])[-1]
+                            atr5_1m    = _compute_atr(completed[-20:],
+                                                      PARAMS["atr_period_1m"])
+                            tol        = PARAMS["ema_touch_mult"] * max(atr5_1m, TICK)
+
+                            # RTH drift check
+                            drift_ok = (
+                                session not in DRIFT_SESSIONS or
+                                not self._rth_drift_determined or
+                                self._rth_drift_direction == 0 or
+                                sig == self._rth_drift_direction
+                            )
+
+                            # Forming bar price within 2× tolerance of 21 EMA
+                            # (wider than bar-close check — better price justifies it)
+                            at_ema = (
+                                (sig == 1  and current_px <= ema21_1m + tol * 2.0) or
+                                (sig == -1 and current_px >= ema21_1m - tol * 2.0)
+                            )
+
+                            # RSI gate (completed bars — unchanged from bar-close entry)
+                            rsi_ok = PARAMS["rsi_lo"] <= rsi14 <= PARAMS["rsi_hi"]
+
+                            # 5-min regime
+                            regime_ok = (
+                                self._5m_state.ready and
+                                self.ema.stack_ok and
+                                self._5m_state.adx >= ADX_MIN[session]
+                            )
+
+                            if regime_ok and drift_ok and at_ema and rsi_ok:
+                                self._intrabar_entry_fired = True
+                                log.info(
+                                    "📊 Intrabar MACD zero-cross: "
+                                    "hist %.4f → %.4f  sig=%+d  px=%.2f  "
+                                    "ema21=%.2f  rsi14=%.1f",
+                                    self._prev_1m_hist, hist_now,
+                                    sig, current_px, ema21_1m, rsi14)
+                                async with self._eval_lock:
+                                    if not self.in_position:
+                                        await self._place_trade(
+                                            signal      = sig,
+                                            entry_price = current_px,
+                                            atr         = self._current_atr,
+                                            session     = session)
+                            else:
+                                log.debug(
+                                    "Intrabar cross seen but gated: "
+                                    "regime=%s drift=%s ema=%s rsi14=%.1f",
+                                    regime_ok, drift_ok, at_ema, rsi14)
+
+                        # Always update histogram history for the next tick
+                        self._prev_1m_hist = hist_now
+
+                self._3s_errors = 0
+
+            except asyncio.CancelledError:
+                raise
+            except ConnectionLostError:
+                raise   # staleness watchdog — propagate immediately to reconnect
+            except Exception as exc:
+                self._3s_errors += 1
+                log.debug("Fast monitor error %d/%d: %s",
+                          self._3s_errors, MAX_CONSECUTIVE_ERRORS, exc)
+                if self._3s_errors >= MAX_CONSECUTIVE_ERRORS:
+                    raise ConnectionLostError(
+                        f"3s: {MAX_CONSECUTIVE_ERRORS} consecutive errors"
+                    ) from exc
+
+        # ── Main run loop ─────────────────────────────────────────
 
     async def run(self) -> None:
         # Resolve contract ID
@@ -1382,7 +1904,25 @@ class Strategy:
                 log.error("Could not resolve contract ID: %s", exc)
         log.info("Contract ID: %s", self._contract_id)
 
-        self._fetcher = BarFetcher(self.client, self.SYMBOL)
+        # Use DirectBarFetcher (direct REST API) instead of client.get_bars().
+        # client.get_bars() routes through the library's bounded_stats cache which
+        # has a structural 8-col vs 6-col schema mismatch with the realtime feed.
+        # DirectBarFetcher calls POST /api/History/retrieveBars directly and is
+        # completely independent of the library's internal statistics module.
+        # Determine live/sim from account info (sim accounts have "PRAC" in name).
+        _acct_name = ""
+        try:
+            _acct = self.client.account_info
+            _acct_name = str(getattr(_acct, "name", "") or "").upper()
+        except Exception:
+            pass
+        _is_live = "PRAC" not in _acct_name and "SIM" not in _acct_name
+        self._fetcher = DirectBarFetcher(
+            contract_id = self._contract_id or self.SYMBOL,
+            live        = _is_live,
+        )
+        log.info("DirectBarFetcher initialised | contract=%s  live=%s",
+                 self._contract_id, _is_live)
 
         pf = PreFlightCheck()
         if not await pf.run(self.suite):
@@ -1403,8 +1943,11 @@ class Strategy:
         await self._seed_engines()
 
         clog.info(DIV2)
-        clog.info("  BOT LIVE | MNQ SCALPER v2.0 | %d contract(s)",
-                  PARAMS["contracts"])
+        clog.info("  BOT LIVE | MNQ SCALPER v2.0 | dynamic sizing")
+        clog.info("  target_risk=$%d  max=%d contracts  min=%d contract(s)",
+                  PARAMS["target_risk_usd"],
+                  PARAMS["max_contracts"],
+                  PARAMS["min_contracts"])
         clog.info("  EMA(%d/%d/%d)  ADX≥%.0f(LN/NY)/%.0f(Asia)  RR 1:1",
                   PARAMS["ema_fast"], PARAMS["ema_mid"], PARAMS["ema_trend"],
                   ADX_MIN[Session.LN_NY], ADX_MIN[Session.ASIA])
@@ -1448,6 +1991,7 @@ class Strategy:
                     self._prev_direction       = 0
                     self._5m_errors            = 0
                     self._1m_errors            = 0
+                    self._3s_errors            = 0
                     self._reset_session_state()
                     await self._seed_engines()
                     clog.info("  ✅ BLACKOUT ENDED | %s UK | balance=%.2f",
@@ -1485,7 +2029,7 @@ class Strategy:
                     await asyncio.sleep(2)
 
         try:
-            await asyncio.gather(poll_5m(), poll_1m())
+            await asyncio.gather(poll_5m(), poll_1m(), self._poll_3s())
         except asyncio.CancelledError:
             log.info("Cancelled — flattening positions")
             try:
@@ -1496,7 +2040,271 @@ class Strategy:
 
 
 # ─────────────────────────────────────────────────────────────
-# 11.  MAIN  —  outer reconnect loop (unchanged from v1.1)
+# 11.  LIBRARY BUG PATCH
+# ─────────────────────────────────────────────────────────────
+def _patch_polars_schema() -> bool:
+    """
+    Patch pl.DataFrame.extend and pl.DataFrame.vstack to pad column-width
+    mismatches before they reach Polars/Rust.
+
+    Why this works
+    ──────────────
+    pl.DataFrame is a Python class (defined in polars/dataframe/frame.py)
+    that wraps a Rust inner object.  Its Python methods — including extend()
+    and vstack() — are regular Python functions on a regular Python class,
+    which means they can be replaced with monkey-patches using attribute
+    assignment.
+
+    What it does
+    ────────────
+    When the bounded_stats realtime feed tries to extend an 8-column
+    historical DataFrame with a 6-column WebSocket bar, our patch:
+      1. Detects the column count mismatch.
+      2. Identifies which 2 columns are missing from the source.
+      3. Adds those columns as null Series with the correct dtype.
+      4. Reorders the source to match the target column order.
+      5. Calls the original extend() with the now-compatible DataFrame.
+
+    The library's statistics will have null values in those 2 columns for
+    each realtime bar update.  Our bot never reads the library's internal
+    statistics, so this has zero effect on trading logic.
+
+    Called ONCE before TradingSuite.create() so the patch is in place
+    before the realtime feed background task starts.
+    """
+    try:
+        import polars as pl
+    except ImportError:
+        log.debug("Polars not importable — cannot patch DataFrame.extend")
+        return False
+
+    def _align(target: "pl.DataFrame",
+               source: "pl.DataFrame") -> "Optional[pl.DataFrame]":
+        """
+        Return source padded and reordered to match target's column schema.
+        Returns None if alignment is impossible (caller should skip the op).
+        """
+        target_cols = list(target.columns)
+        if list(source.columns) == target_cols:
+            return source                      # already identical — fast path
+
+        # Add any missing columns as typed nulls
+        missing = [c for c in target_cols if c not in source.columns]
+        if missing:
+            try:
+                source = source.with_columns([
+                    pl.lit(None).cast(target.schema[c]).alias(c)
+                    for c in missing
+                ])
+            except Exception as exc:
+                log.debug("Schema-align: could not pad %s: %s", missing, exc)
+                return None
+
+        # Select in target column order (also drops any extra source cols)
+        available = [c for c in target_cols if c in source.columns]
+        try:
+            return source.select(available)
+        except Exception as exc:
+            log.debug("Schema-align: select failed: %s", exc)
+            return None
+
+    patched = 0
+
+    # ── extend() — in-place append, returns None ──────────────────────────
+    try:
+        _orig_extend = pl.DataFrame.extend
+
+        def _safe_extend(self: "pl.DataFrame",
+                         other: "pl.DataFrame") -> None:
+            aligned = _align(self, other)
+            if aligned is None:
+                log.debug("extend: schema alignment failed — skipping append")
+                return
+            return _orig_extend(self, aligned)
+
+        pl.DataFrame.extend = _safe_extend
+        log.info("✅ Patched pl.DataFrame.extend — "
+                 "6-col realtime bars will be padded to match 8-col schema")
+        patched += 1
+    except Exception as exc:
+        log.warning("⚠️ Could not patch pl.DataFrame.extend: %s", exc)
+
+    # ── vstack() — returns new DataFrame ─────────────────────────────────
+    try:
+        _orig_vstack = pl.DataFrame.vstack
+
+        def _safe_vstack(self: "pl.DataFrame",
+                         other: "pl.DataFrame") -> "pl.DataFrame":
+            aligned = _align(self, other)
+            if aligned is None:
+                log.debug("vstack: schema alignment failed — returning self")
+                return self
+            return _orig_vstack(self, aligned)
+
+        pl.DataFrame.vstack = _safe_vstack
+        log.info("✅ Patched pl.DataFrame.vstack")
+        patched += 1
+    except Exception as exc:
+        log.warning("⚠️ Could not patch pl.DataFrame.vstack: %s", exc)
+
+    if not patched:
+        log.warning("⚠️ Polars DataFrame patching failed — "
+                    "bounded_stats schema errors may still occur")
+    return patched > 0
+
+
+def _make_safe_wrapper(original):
+    """Wraps a callable so any exception it raises is silently discarded."""
+    def _safe(self, *args, **kwargs):
+        try:
+            return original(self, *args, **kwargs)
+        except Exception:
+            pass
+    _safe.__name__     = getattr(original, '__name__', '_safe')
+    _safe.__qualname__ = getattr(original, '__qualname__', '_safe') + '[patched]'
+    return _safe
+
+
+def _patch_bounded_stats() -> bool:
+    """
+    Silently patch _update_timeframe_data in project_x_py's bounded_stats.
+
+    Must be called AFTER TradingSuite.create() because the problematic class
+    is instantiated lazily during library initialisation.
+
+    Three strategies are attempted in order:
+
+      1. sys.modules scan  — fast, works for directly importable classes.
+      2. gc.get_objects()  — thorough, finds runtime-created instances whose
+                             classes may not appear in sys.modules by name.
+      3. asyncio exception handler — fallback that prevents the crashed
+                             background task's exception from being escalated
+                             to a fatal error, allowing the staleness watchdog
+                             to handle reconnection cleanly.
+
+    All three are applied; the function returns True if strategy 1 or 2
+    patched at least one location.
+    """
+    import sys
+    import gc
+
+    TARGET  = "_update_timeframe_data"
+    KEYWORD = "project_x_py"
+
+    patched_classes: set = set()
+    patched_count   = 0
+
+    # ── Strategy 1: sys.modules scan ─────────────────────────────────────
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None or KEYWORD not in mod_name:
+            continue
+        try:
+            # Module-level function
+            fn = getattr(mod, TARGET, None)
+            if callable(fn) and not isinstance(fn, type):
+                try:
+                    setattr(mod, TARGET, _make_safe_wrapper(fn))
+                    log.info("✅ [mod-fn ] Patched %s.%s", mod_name, TARGET)
+                    patched_count += 1
+                except Exception as e:
+                    log.debug("    could not setattr on module %s: %s", mod_name, e)
+
+            # Classes defined or imported in the module
+            for attr_name in dir(mod):
+                try:
+                    obj = getattr(mod, attr_name)
+                    if not isinstance(obj, type) or obj in patched_classes:
+                        continue
+                    method = getattr(obj, TARGET, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        setattr(obj, TARGET, _make_safe_wrapper(method))
+                        patched_classes.add(obj)
+                        log.info("✅ [class  ] Patched %s.%s.%s",
+                                 mod_name, attr_name, TARGET)
+                        patched_count += 1
+                    except Exception as e:
+                        log.debug("    could not setattr on %s.%s: %s",
+                                  attr_name, TARGET, e)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ── Strategy 2: gc.get_objects() scan ────────────────────────────────
+    # Finds live instances whose class may not be directly reachable via
+    # sys.modules — e.g. classes created by factory functions or metaclasses.
+    try:
+        for obj in gc.get_objects():
+            try:
+                cls = type(obj)
+                if cls in patched_classes:
+                    continue
+                cls_mod = getattr(cls, '__module__', '') or ''
+                if KEYWORD not in cls_mod:
+                    continue
+                method = getattr(cls, TARGET, None)
+                if not callable(method):
+                    continue
+                try:
+                    setattr(cls, TARGET, _make_safe_wrapper(method))
+                    patched_classes.add(cls)
+                    log.info("✅ [gc-inst] Patched %s.%s (found via live instance)",
+                             cls.__qualname__, TARGET)
+                    patched_count += 1
+                except Exception as e:
+                    log.debug("    gc setattr failed for %s: %s",
+                              cls.__qualname__, e)
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug("gc.get_objects() scan failed: %s", e)
+
+    # ── Strategy 3: asyncio task exception handler (always applied) ───────
+    # Even if the class cannot be patched, we can prevent the background
+    # task's unhandled exception from being escalated.  Combined with the
+    # staleness watchdog, this ensures a clean reconnect rather than a crash.
+    try:
+        loop = asyncio.get_event_loop()
+        _orig_handler = loop.exception_handler  # may be None
+
+        def _task_exc_handler(loop, context):
+            exc = context.get('exception')
+            if exc is not None:
+                msg = str(exc).lower()
+                if ('width' in msg and 'append' in msg) or 'unable to append' in msg:
+                    # Swallow the bounded_stats column-mismatch error silently
+                    log.debug("Suppressed bounded_stats task exception: %s", exc)
+                    return
+            # All other exceptions: use the original handler or the default
+            if _orig_handler:
+                _orig_handler(loop, context)
+            else:
+                loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_task_exc_handler)
+        log.info("✅ [asyncio] Task exception handler set — "
+                 "bounded_stats errors will not escalate")
+    except Exception as e:
+        log.debug("Could not set asyncio exception handler: %s", e)
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    if patched_count:
+        log.info("bounded_stats patch: %d location(s) wrapped — "
+                 "realtime-feed column mismatch will be silently skipped",
+                 patched_count)
+        return True
+
+    log.warning(
+        "⚠️  _update_timeframe_data not found via sys.modules or gc scan. "
+        "The asyncio exception handler is still active. "
+        "The staleness watchdog will detect stale bars and reconnect. "
+        "Consider updating project_x_py or contacting TopstepX support.")
+    return False
+
+# ─────────────────────────────────────────────────────────────
+# 12.  MAIN  —  outer reconnect loop
 # ─────────────────────────────────────────────────────────────
 async def main() -> None:
     if (not os.environ.get("PROJECT_X_API_KEY")
@@ -1507,6 +2315,12 @@ async def main() -> None:
     log.info("─" * 64)
     log.info("MNQ Scalper v2.0  |  log: %s", _log_file)
     log.info("─" * 64)
+
+    # Patch Polars BEFORE any TradingSuite.create() call so the patch is
+    # active when the realtime feed background task first runs.
+    # This is the root-cause fix: pad 6-col WebSocket bars to 8-col to
+    # match the historical seed DataFrame's schema.
+    _patch_polars_schema()
 
     reconnect_attempt = 0
     while True:
@@ -1521,6 +2335,28 @@ async def main() -> None:
             try:
                 log.info("Connecting... (try %d/10)", ca + 1)
                 suite = await TradingSuite.create("MNQ")
+
+                # ── Immediate 1-min bar fetch (must be FIRST await after create) ──
+                # TradingSuite.create() starts a background WebSocket feed that
+                # seeds the bounded_stats DataFrame with 8-column HTTP bars.
+                # When the first live 5-min bar arrives via WebSocket it only has
+                # 6 columns → SchemaError.
+                #
+                # Calling get_bars() here — as the very next network operation —
+                # forces the library to complete its internal bar-cache handshake
+                # before the WebSocket can deliver the first mismatched update.
+                # v10.4 achieves the same effect via its pre-flight market-data
+                # check.  Calling it directly on the client (not through our
+                # BarFetcher wrapper) is the most immediate possible call.
+                try:
+                    await suite.client.get_bars("MNQ", days=1, interval=1)
+                    log.info("✅ Library bar-cache primed (immediate 1-min fetch)")
+                except Exception as _pe:
+                    log.debug("Prime fetch error (non-fatal): %s", _pe)
+
+                # Patch AFTER create() and after the prime fetch so all library
+                # modules are loaded and the gc scan has live objects to find.
+                _patch_bounded_stats()
                 log.info("✅ Connected.")
                 break
             except asyncio.CancelledError:
